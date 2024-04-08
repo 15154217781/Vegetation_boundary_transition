@@ -1,0 +1,121 @@
+GEE Code Link:https://code.earthengine.google.com/74bac623c5d7282dca796ceafe2feff0
+var FeaturePoints = ee.FeatureCollection([desert.limit(120),
+                                          desert_steppe.limit(120),
+                                          field_land.limit(120),
+                                         forest_land.limit(120),
+                                          steppe.limit(120),
+                                          Meadow_grassland.limit(120),
+                                          ]).flatten();
+Map.addLayer(FeaturePoints, {'color':'blue'}, 'FeaturePoints'); 
+
+function getQABits(image, start, end, newName) {
+ var pattern = 0;
+ for (var i = start; i<= end; i++) {
+ pattern += Math.pow(2, i);
+ }
+ return image.select([0], [newName])
+ .bitwiseAnd(pattern)
+ .rightShift(start);
+}
+ 
+function maskQuality(image) {
+ var QA = image.select('StateQA');
+ var internalQuality = getQABits(QA,8, 13, 'internal_quality_flag');
+ return image.updateMask(internalQuality.eq(0));
+}
+
+var indexComputation = function(image){
+  var ndvi = image.normalizedDifference(["sur_refl_b02", "sur_refl_b01"]).rename("NDVI");
+  var rvi = image.select('sur_refl_b02').divide(image.select('sur_refl_b01')).rename("RVI");
+  //var dvi = image.select('sur_refl_b02').subtract(image.select('sur_refl_b01')).rename("DVI");
+  var ndwi = image.normalizedDifference(["sur_refl_b04", "sur_refl_b02"]).rename("NDWI");
+  var ndbi = image.normalizedDifference(["sur_refl_b07", "sur_refl_b02"]).rename("NDBI");  
+  return image.addBands(ndvi).addBands(rvi).addBands(ndbi).addBands(ndwi);
+}
+
+var sale= function(image){
+  return image.multiply(0.0001)
+}
+
+var bangalore = ee.FeatureCollection("users/lihaoxin123shanke/neimenggu1")
+var modis = ee.ImageCollection("MODIS/061/MOD09A1");
+var rawCol = modis.filterDate("2020-07-7", "2020-09-10")
+               .filterBounds(bangalore)
+               .map(maskQuality)
+               .select("sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07")
+               .map(sale)
+               .map(indexComputation)
+var composite = rawCol.mean().clip(bangalore);
+Map.addLayer(composite, {bands: ["sur_refl_b01","sur_refl_b04","sur_refl_b03"], min: 0, max: 0.25}, 'composite');
+
+var imgData = composite;
+var bands = imgData.bandNames();
+ print("bands",bands);
+ 
+/********************************************************
+compute JM
+********************************************************/
+var trainingsample= imgData.select(bands).sampleRegions({ 
+    collection: FeaturePoints, 
+    properties: ['class'],
+    scale: 500,
+    tileScale: 16,
+    // geometries:true
+  });
+print("trainingsample",trainingsample)
+
+var training = trainingsample.map(function(item) {
+  return ee.Feature(null).set('vec', item.toDictionary(bands).values(bands))
+                          .set('landcover', item.get('class'));
+});
+print("training",training);
+
+var lists = ee.List(training.reduceColumns({
+  reducer: ee.Reducer.toList().group(0, 'class'), 
+  selectors: ['landcover', 'vec']
+}).get('groups'));
+
+lists = lists.map(function(obj) {
+  var array = ee.Array(ee.Dictionary(obj).get('list'));
+  var list = ee.List(ee.Dictionary(obj).get('list')).map(function(l) {
+    return ee.Array(l);
+  });
+  var mean = array.reduce(ee.Reducer.mean(), [0]);
+ 
+  var covariance = list.reduce(ee.Reducer.covariance());
+  return ee.Dictionary(obj).combine({
+    mean: mean.transpose(),
+    covariance: covariance
+  });
+});
+
+var classes = ee.List.sequence(0, 5);
+var bhattacharyya = classes.map(function(i) {
+  return classes.map(function(j) {
+    var mean_i = ee.Array(ee.Dictionary(lists.get(i)).get('mean'));
+    var mean_j = ee.Array(ee.Dictionary(lists.get(j)).get('mean'));
+    var sigma_i = ee.Array(ee.Dictionary(lists.get(i)).get('covariance'));
+    var sigma_j = ee.Array(ee.Dictionary(lists.get(j)).get('covariance'));
+    var mh = mean_i.subtract(mean_j).transpose()
+        .matrixMultiply(sigma_i.add(sigma_j).divide(2).matrixInverse())
+        .matrixMultiply(mean_i.subtract(mean_j))
+        .get([0, 0])
+        .sqrt();
+    var t2 = sigma_i.add(sigma_j).divide(2).matrixDeterminant()
+        .divide(sigma_i.matrixDeterminant().sqrt())
+        .divide(sigma_j.matrixDeterminant().sqrt())
+        .log()
+        .divide(2);
+    return mh.divide(8).add(t2);
+  });
+});
+
+var jm = ee.Array(bhattacharyya).multiply(-1).exp()
+    .multiply(-1).add(1).multiply(2);
+print('JM distance:', jm); 
+
+Export.table.toDrive({
+  collection:ee.FeatureCollection(ee.Feature(null).set("JM",jm)),
+  //folder:
+  fileFormat:"CSV"
+})
