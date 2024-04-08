@@ -1,0 +1,139 @@
+GEE Code Link:https://code.earthengine.google.com/d0971ae2381970abcf1f498ea42b00be
+var bangalore = ee.FeatureCollection("users/lihaoxin123shanke/neimenggu1")
+var modis = ee.ImageCollection("MODIS/061/MOD09A1");
+var sale= function(image){
+  return image.multiply(0.0001)
+}
+
+var indexComputation = function(image){
+  var ndvi = image.normalizedDifference(["sur_refl_b02", "sur_refl_b01"]).rename("NDVI");
+  var rvi = image.select('sur_refl_b02').divide(image.select('sur_refl_b01')).rename("RVI");
+  //var dvi = image.select('sur_refl_b02').subtract(image.select('sur_refl_b01')).rename("DVI");
+  var ndwi = image.normalizedDifference(["sur_refl_b04", "sur_refl_b02"]).rename("NDWI");
+  var ndbi = image.normalizedDifference(["sur_refl_b07", "sur_refl_b02"]).rename("NDBI");  
+  return image.addBands(ndvi).addBands(rvi).addBands(ndwi).addBands(ndbi);
+}
+
+
+function getQABits(image, start, end, newName) {
+ var pattern = 0;
+ for (var i = start; i<= end; i++) {
+ pattern += Math.pow(2, i);
+ }
+ return image.select([0], [newName])
+ .bitwiseAnd(pattern)
+ .rightShift(start);
+}
+ 
+function maskQuality(image) {
+ var QA = image.select('StateQA');
+ var internalQuality = getQABits(QA,8, 13, 'internal_quality_flag');
+ return image.updateMask(internalQuality.eq(0));
+}
+
+function clipImg(image){
+  return image.clipToCollection(bangalore);
+}
+Map.addLayer(bangalore, {color: 'red'}, "rf1");
+Map.centerObject(bangalore,8);
+
+//upload imagecollection
+var year = 2020;
+var rawCol = modis.filterDate(year+'-07-07',year+ '-9-10')
+               .filterBounds(bangalore)
+               .map(maskQuality)
+               .select("sur_refl_b01","sur_refl_b02","sur_refl_b03","sur_refl_b04","sur_refl_b05","sur_refl_b06","sur_refl_b07")
+               .map(sale)
+               .map(indexComputation)
+               .map(clipImg);
+var composite = rawCol.mean().clip(bangalore);
+Map.addLayer(composite, {bands: ["sur_refl_b01","sur_refl_b04","sur_refl_b03"], min: 0, max: 0.25}, 'composite');
+print(composite,'composite')
+
+var gcps = desert.merge(desert_steppe).merge(field_land).merge(forest_land).merge(steppe).merge(Meadow_grassland);
+var palette = ee.List(['gray','blue','green','red','yellow', 'purple'])
+var landcover = ee.List([ 1, 2, 3, 4, 5, 6])
+
+var classProperty = 'class';
+var trainingData = gcps.randomColumn('random')
+
+var sample_training = trainingData.filter(ee.Filter.lte("random", 0.7));
+var sample_validate  = trainingData.filter(ee.Filter.gt("random", 0.7));
+Map.addLayer(sample_training,{color:'red'},'training samples')
+Map.addLayer(sample_validate,{color:'blue'},'validation samples')
+
+var training = composite.sampleRegions({
+  collection: sample_training, 
+  properties: ["class"], 
+  scale: 500,
+  tileScale:16
+});
+
+var validation = composite.sampleRegions({
+  collection: sample_validate, 
+  properties: ["class"], 
+  scale: 500,
+  tileScale:16
+});
+
+var trainedClassifier = ee.Classifier.smileRandomForest(500) 
+    .train({
+      features: training,
+      classProperty: 'class',
+      inputProperties:composite.bandNames()
+});
+
+var class_img = composite.classify(trainedClassifier);
+Map.addLayer(class_img.clip(bangalore), {min: 1, max: 6, palette: ['gray','blue','green','red','yellow', 'purple']}, '2020');
+
+
+
+var validated = validation.classify(trainedClassifier);
+var testAccuracy = validated.errorMatrix('class', 'classification');
+var accuracy = testAccuracy.accuracy();
+var userAccuracy = testAccuracy.consumersAccuracy();
+var producersAccuracy = testAccuracy.producersAccuracy();
+var kappa = testAccuracy.kappa();
+
+print('混淆矩阵:', testAccuracy);//
+print('用户分类精度:', userAccuracy);//用户分类精度
+print('生产者精度:', producersAccuracy);//生产者精度
+print('总体分类精', accuracy);//总体分类精度
+print('Kappa:', kappa);
+
+var numTrees = ee.List.sequence(5, 500, 10); /////////////////////don't forget to change
+var accuracies = numTrees.map(function(t)
+{ 
+  var classifier = ee.Classifier.smileRandomForest(t)
+                    .train({
+                    features: training,
+                    classProperty: 'class',
+                    inputProperties: composite.bandNames()
+                    });
+  return training
+      .classify(classifier)
+      .errorMatrix('class', 'classification')
+      .accuracy();
+  }); 
+print(ui.Chart.array.values({
+  array: ee.Array(accuracies),
+  axis: 0,
+  xLabels: numTrees
+}));
+
+
+var dict = trainedClassifier.explain();
+print('Explain:',dict);
+ 
+var variable_importance = ee.Feature(null, ee.Dictionary(dict).get('importance'));
+var chart =
+  ui.Chart.feature.byProperty(variable_importance)
+  .setChartType('ColumnChart')
+  .setOptions({
+  title: '训练样本占' +80+ '__Random Forest Variable Importance',
+  legend: {position: 'none'},
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Importance'}
+});
+ 
+print(chart);
